@@ -22,6 +22,10 @@ def L(th_st, dth_st, th_sw, dth_sw):
 def Ld(th_st_0, th_sw_0, th_st_1, th_sw_1):
     return h*L((th_st_0 + th_st_1) / 2, (th_st_1 - th_st_0) / h, (th_sw_0 + th_sw_1) / 2, (th_sw_1 - th_sw_0) / h)
 
+def D1_L(th_st, dth_st, th_sw, dth_sw):
+    L_expr = L(th_st, dth_st, th_sw, dth_sw)
+    return [simplediff(L_expr, th_st), simplediff(L_expr, th_sw)]
+
 def D2_L(th_st, dth_st, th_sw, dth_sw):
     L_expr = L(th_st, dth_st, th_sw, dth_sw)
     return [simplediff(L_expr, dth_st), simplediff(L_expr, dth_sw)]
@@ -34,10 +38,21 @@ def D2_Ld(th_st_0, th_sw_0, th_st_1, th_sw_1):
     Ld_expr = Ld(th_st_0, th_sw_0, th_st_1, th_sw_1)
     return [simplediff(Ld_expr, th_st_1), simplediff(Ld_expr, th_sw_1)]
 
+
+
 th_st = Symbol('th_st')
 dth_st = Symbol('dth_st')
 th_sw = Symbol('th_sw')
 dth_sw = Symbol('dth_sw')
+
+M = Matrix([
+    [(mh + m)*l*l + m*a*a, -m*l*b*cos(th_st - th_sw)], 
+    [-m*l*b*cos(th_st - th_sw), m*b*b]
+])
+print "M^-1:", M.inv()
+quit()
+
+print "D1_L:", D1_L(th_st, dth_st, th_sw, dth_sw)
 print "D2_L:", D2_L(th_st, dth_st, th_sw, dth_sw)
 
 th_st_0 = Symbol('th_st_0')
