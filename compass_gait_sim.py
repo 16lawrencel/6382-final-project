@@ -31,7 +31,7 @@ from pydrake.examples.compass_gait import (CompassGait, CompassGaitParams)
 from underactuated import (PlanarRigidBodyVisualizer)
 
 class CompassGaitController(VectorSystem):
-    def __init__(self, compass_gait, params):
+    def __init__(self, compass_gait, params, reset_state):
         self.compass_gait = compass_gait
         self.num_states = compass_gait.get_output_port(0).size()
         self.params = params
@@ -39,6 +39,17 @@ class CompassGaitController(VectorSystem):
         VectorSystem.__init__(self, self.num_states, 1)
         
         self.prev_state = None
+        self.u_list = []
+        self.time_array = []
+        self.num_steps = 0
+        self.freq = 1./30000 # frequency of calls to calcvectoroutput, measure empirically
+        self.reset_state = reset_state
+        
+    def is_reset(self, state):
+        """
+        Returns whether the current state is the start of a new reset (comparing with self.prev_state)
+        """
+        return self.prev_state is not None and self.prev_state[0] * state[0] < 0 and abs(state[0]) > 0.01
     
     def print_reset(self, state):
         """
@@ -47,12 +58,150 @@ class CompassGaitController(VectorSystem):
             start: [-0.219, 0.324, 1.093, 0.376]
             end:   [0.324, -0.219, 1.496, 1.81]
         """
-        if self.prev_state is not None and self.prev_state[0] * state[0] < 0 and abs(state[0]) > 0.01:
+        if self.is_reset(state):
             print "RESET"
             print self.prev_state
             print state
     
+    def cg_dynamics(self, state, u):
+        derivs = np.zeros_like(state)
+        derivs[:2] = state[2:]
+        
+        # define params
+        mh = self.params.mass_hip()
+        m = self.params.mass_leg()
+        l = self.params.length_leg()
+        b = self.params.center_of_mass_leg()
+        g = self.params.gravity()
+        a = l - b
+        th_st = state[0]
+        th_sw = state[1]
+        v_st = state[2]
+        v_sw = state[3]
+        
+        M_inv = np.array([
+            [b**2*m/(-b**2*l**2*m**2*cos(th_st - th_sw)**2 + b**2*m*(a**2*m + l**2*(m + mh))), b*l*m*cos(th_st - th_sw)/(-b**2*l**2*m**2*cos(th_st - th_sw)**2 + b**2*m*(a**2*m + l**2*(m + mh)))], 
+            [b*l*m*cos(th_st - th_sw)/(-b**2*l**2*m**2*cos(th_st - th_sw)**2 + b**2*m*(a**2*m + l**2*(m + mh))), (a**2*m + l**2*(m + mh))/(-b**2*l**2*m**2*cos(th_st - th_sw)**2 + b**2*m*(a**2*m + l**2*(m + mh)))]])
+        
+        """
+        M = np.array([
+            [(mh + m)*l*l + m*a*a, -m*l*b*cos(th_st - th_sw)], 
+            [-m*l*b*cos(th_st - th_sw), m*b*b]
+        ])
+        """
+        
+        C = np.array([
+            [0, -m*l*b*sin(th_st - th_sw) * v_sw], 
+            [m*l*b*sin(th_st - th_sw) * v_st, 0]
+        ])
+        
+        tau_g = np.array([
+            [(mh*l + m*a + m*l)*g*sin(1.*th_st)], 
+            [-m*b*g*sin(1.*th_sw)]
+        ])
+        
+        u_eff = np.array([
+            [-u],
+            [u]
+        ])
+        
+        v = np.reshape(state[2:], (-1, 1))
+        derivs[2:] = M_inv.dot(tau_g + u_eff - C.dot(v)).flatten()
+        return derivs
+    
     def compute_trajectory(self, state_initial, state_final, min_time, max_time, test_traj = None):
+        print("Computing trajectory")
+        
+        test_mode = (test_traj is not None)
+        
+        mp = MathematicalProgram()
+        #mp.SetSolverOption(SolverType.kSnopt, "Major iterations limit", 2000)
+        
+        if test_mode:
+            num_time_steps = len(test_traj[0]) - 1
+        else:
+            num_time_steps = 100
+        
+        # create u_over_time as variables
+        k = 0
+        u = mp.NewContinuousVariables(num_time_steps + 1, "u")
+        
+        # create states_over_time as variables
+        k = 0
+        states_over_time = mp.NewContinuousVariables(4, "state_%d" % k)
+        for k in range(1, num_time_steps + 1):
+            state = mp.NewContinuousVariables(4, "state_%d" % k)
+            states_over_time = np.vstack((states_over_time, state))
+        
+        # create time_array variables
+        k = 0
+        time_array = mp.NewContinuousVariables(num_time_steps+1, "time_array")
+        mp.AddConstraint(time_array[0] == 0)
+        """
+        for k in range(1, num_time_steps + 1):
+            mp.AddConstraint(time_array[k] - time_array[k-1] >= 0.01)
+            mp.AddConstraint(time_array[k] - time_array[k-1] <= 0.3)
+        """
+        
+        for k in range(2, num_time_steps + 1):
+            mp.AddConstraint(time_array[k] - time_array[k-1] == time_array[k-1] - time_array[k-2])
+        
+        mp.AddConstraint(time_array[-1] >= min_time)
+        mp.AddConstraint(time_array[-1] <= max_time)
+        
+        if test_traj is not None:
+            assert len(test_traj) == 3
+            states, u, time_array = test_traj
+        
+        def AddZeroConstraint(constraint, eps = 0):
+            if test_mode:
+                if abs(constraint[0]) > 0.0001 or abs(constraint[1] > 0.0001):
+                    print "Zero Constraint value =", constraint
+            else:
+                for i in range(len(constraint)):
+                    if eps == 0:
+                        mp.AddConstraint(constraint[i] == 0)
+                    else:
+                        assert eps > 0
+                        mp.AddConstraint(constraint[i] <= eps)
+                        mp.AddConstraint(constraint[i] >= -eps)
+        
+        # constraints for initial and final states
+        AddZeroConstraint(states_over_time[0] - state_initial)
+        AddZeroConstraint(states_over_time[-1] - state_final)
+        
+        # we'll now simulate forward in time and add direct transcription constraints
+        for k in range(1, num_time_steps + 1):
+            time_step = time_array[k] - time_array[k-1]
+            state_next = states_over_time[k-1] + time_step * self.cg_dynamics(states_over_time[k-1], u[k-1])
+            
+            if k < 10:
+                slack = 0.001
+            else:
+                slack = 0
+                
+            AddZeroConstraint(state_next - states_over_time[k])
+        
+        # add quadratic cost for u
+        mp.AddQuadraticCost(u.dot(u))
+        
+        # solve and return output
+        result = Solve(mp)
+        
+        if not result.is_success():
+            infeasible = GetInfeasibleConstraints(mp, result)
+            print "Infeasible constraints:"
+            print len(infeasible)
+            for i in range(len(infeasible)):
+                print infeasible[i]
+        
+        trajectory = result.GetSolution(states_over_time)
+        input_trajectory = result.GetSolution(u)
+        time_array = result.GetSolution(time_array)
+        
+        return trajectory, input_trajectory, time_array
+    
+    def compute_trajectory_DMOC(self, state_initial, state_final, min_time, max_time, test_traj = None):
         """
         Uses DMOC method to compute a trajectory from specified initial state to final state, following 
         compass gait dynamics.
@@ -68,6 +217,7 @@ class CompassGaitController(VectorSystem):
         The optimizer will then operate in test mode, where instead of adding constraints it will test the 
         values of the constraints on the values.
         """
+        print("Computing trajectory")
         test_mode = (test_traj is not None)
         
         mp = MathematicalProgram()
@@ -77,8 +227,6 @@ class CompassGaitController(VectorSystem):
             num_time_steps = len(test_traj[0]) - 1
         else:
             num_time_steps = 100
-
-        slack = 0.001
         
         ###########################
         # Define variables for MP #
@@ -95,14 +243,26 @@ class CompassGaitController(VectorSystem):
         u = mp.NewContinuousVariables(num_time_steps + 1, "u")
         
         # create time_step variable
+        k = 0
+        time_array = mp.NewContinuousVariables(num_time_steps+1, "time_array")
+        mp.AddConstraint(time_array[0] == 0)
+        for k in range(1, num_time_steps + 1):
+            mp.AddConstraint(time_array[k] - time_array[k-1] >= 0.01)
+            mp.AddConstraint(time_array[k] - time_array[k-1] <= 0.3)
+        
+        mp.AddConstraint(time_array[-1] >= min_time)
+        mp.AddConstraint(time_array[-1] <= max_time)
+        
+        """
         time_step = mp.NewContinuousVariables(1, "time_step")
         total_time = time_step[0] * num_time_steps
         mp.AddConstraint(total_time >= min_time)
         mp.AddConstraint(total_time <= max_time)
+        """
         
         if test_traj is not None:
             assert len(test_traj) == 3
-            states, u, time_step = test_traj
+            states, u, time_array = test_traj
         
         #########################
         # Some helper functions #
@@ -115,10 +275,11 @@ class CompassGaitController(VectorSystem):
         b = self.params.center_of_mass_leg()
         g = self.params.gravity()
         a = l - b
-        h = time_step
         
         # Note that the B matrix is [-1, 1], which represents how 
         # u actually affects the dynamics
+        #def geth(k): return time_array[k+1] - time_array[k]
+        
         def u_eff(k): return np.array([-u[k], u[k]])
         def u_plus(k): return h/4*(u_eff(k) + u_eff(k+1))
         def u_minus(k): return h/4*(u_eff(k) + u_eff(k+1))
@@ -178,12 +339,18 @@ class CompassGaitController(VectorSystem):
             return npconcat(D2_Ld_raw(states[k,0], states[k,1], states[k+1,0], states[k+1,1]))
         
         # helper function for adding constraints
-        def AddZeroConstraint(constraint):
+        def AddZeroConstraint(constraint, eps = 0):
             if test_mode:
-                print "Zero Constraint value =", constraint
+                if abs(constraint[0]) > 0.0001 or abs(constraint[1] > 0.0001):
+                    print "Zero Constraint value =", constraint
             else:
                 for i in range(len(constraint)):
-                    mp.AddConstraint(constraint[i] == 0)
+                    if eps == 0:
+                        mp.AddConstraint(constraint[i] == 0)
+                    else:
+                        assert eps > 0
+                        mp.AddConstraint(constraint[i] <= eps)
+                        mp.AddConstraint(constraint[i] >= -eps)
         
         ########################
         # Add DMOC constraints #
@@ -198,15 +365,23 @@ class CompassGaitController(VectorSystem):
         
         # Add dynamics constraints
         for k in range(0, num_time_steps + 1):
+            slack = 0
+            if k < 3 or num_time_steps - k < 3:
+                slack = 0.001
+            
+            if k < num_time_steps:
+                if k > 0:
+                    h = (time_array[k+1] - time_array[k-1]) / 2
+                else:
+                    h = time_array[k+1] - time_array[k]
+                            
             #print "ENERGY", Ed(states[k,0], states[k,1], states[k+1,0], states[k+1,1])
             if k == 0:
-                print(q0_dot, (states[1]-states[0])/h)
-                print(D2_L(q0, q0_dot), D1_Ld(k), u_minus(k))
-                AddZeroConstraint(D2_L(q0, q0_dot) + D1_Ld(k) + u_minus(k))
+                AddZeroConstraint(D2_L(q0, q0_dot) + D1_Ld(k) + u_minus(k), slack)
             elif k < num_time_steps:
-                AddZeroConstraint(D2_Ld(k-1) + D1_Ld(k) + u_plus(k-1) + u_minus(k))
+                AddZeroConstraint(D2_Ld(k-1) + D1_Ld(k) + u_plus(k-1) + u_minus(k), slack)
             else:
-                AddZeroConstraint(-D2_L(qf, qf_dot) + D1_Ld(k-1) + u_plus(k-1))
+                AddZeroConstraint(-D2_L(qf, qf_dot) + D2_Ld(k-1) + u_plus(k-1))
         
         # Add cost function
         mp.AddQuadraticCost(u.dot(u))
@@ -219,28 +394,61 @@ class CompassGaitController(VectorSystem):
         ################
         
         result = Solve(mp)
+        """
         if not result.is_success():
             infeasible = GetInfeasibleConstraints(mp, result)
             print "Infeasible constraints:"
             print len(infeasible)
             for i in range(len(infeasible)):
                 print infeasible[i]
+        """
         
         states = result.GetSolution(states)
         u = result.GetSolution(u)
-        time_step = result.GetSolution(time_step)
+        time_array = result.GetSolution(time_array)
+        #time_step = result.GetSolution(time_step)
         
-        return states, u, time_step
-        
+        return states, u, time_array
+    
+    def getTime(self):
+        """
+        Gets the internal clock's time, assuming the frequency of calls to DoCalcVectorOutput as measured
+        """
+        return self.num_steps * self.freq
+    
     def DoCalcVectorOutput(self, context, state, _, out):
         self.print_reset(state)
         
+        if self.is_reset(state):
+            # reset u_list
+            self.u_list = []
+        
         self.prev_state = state
-        out[0] = 0
+        
+        self.num_steps += 1
+        #out[0] = 0
+        #return
+        
+        min_time = 1
+        max_time = 5
+        #state_final = np.array([0.324, -0.219, 1.496, 1.81])
+        
+        if len(self.u_list) <= 1:
+            print self.num_steps
+            states, self.u_list, self.time_array = self.compute_trajectory_DMOC(state, self.reset_state, min_time, max_time)
+        
+        self.time_array += self.getTime() # adjust by current time
+        
+        t0 = self.getTime() - self.time_array[0]
+        t1 = self.time_array[1] - self.getTime()
 
-        return 0
+        while len(self.time_array) > 1 and self.time_array[1] <= self.getTime():
+            # pop one item from u_list / time_array
+            self.u_list = self.u_list[1:]
+            self.time_array = self.time_array[1:]
 
-
+        out[0] = (self.u_list[0] * t1 + self.u_list[1] * t0) / (t0 + t1) # linear interpolation
+            
 def Simulate2dCompassGait(duration):
 
     tree = RigidBodyTree(FindResourceOrThrow(
@@ -264,16 +472,17 @@ def Simulate2dCompassGait(duration):
     # Create a logger to log at 30hz
     state_dim = compass_gait.get_output_port(1).size()
     state_log = builder.AddSystem(SignalLogger(state_dim))
-    state_log.DeclarePeriodicPublish(0.0333, 0.0) # 30hz logging
+    state_log.DeclarePeriodicPublish(1./30, 0.0) # 30hz logging
     builder.Connect(compass_gait.get_output_port(1), state_log.get_input_port(0))
     
     minimal_state_log = builder.AddSystem(SignalLogger(4))
-    minimal_state_log.DeclarePeriodicPublish(1./300, 0.0) # 100hz logging
+    minimal_state_log.DeclarePeriodicPublish(1./10000, 0.0) # 300hz logging
     builder.Connect(compass_gait.get_output_port(0), minimal_state_log.get_input_port(0))
     
     # Create a controller
+    reset_state = np.array([0.324, -0.219, 1.496, 1.81]) # reset state to aim for when optimizing
     controller = builder.AddSystem(
-        CompassGaitController(compass_gait, params))
+        CompassGaitController(compass_gait, params, reset_state))
     builder.Connect(compass_gait.get_output_port(0), controller.get_input_port(0))
     builder.Connect(controller.get_output_port(0), compass_gait.get_input_port(0))
 
@@ -282,7 +491,6 @@ def Simulate2dCompassGait(duration):
                                                              ylim=[-1., 2.],
                                                              figsize_multiplier=2))
     builder.Connect(compass_gait.get_output_port(1), visualizer.get_input_port(0))
-    #print(compass_gait.get_input_port(0))
 
     diagram = builder.Build()
     simulator = Simulator(diagram)
@@ -298,9 +506,10 @@ def Simulate2dCompassGait(duration):
     context.SetContinuousState(initial_state)
 
     simulator.StepTo(duration)
+    print(controller.num_steps)
     return visualizer, state_log, minimal_state_log
 
-def ComputeTrajectory(state_initial, state_final, min_time, max_time, test_traj = None):
+def ComputeTrajectory(state_initial, state_final, min_time, max_time, test_traj = None, DMOC = False):
     """
     Invokes the controller's trajectory optimization procedure to 
     find a trajectory from state_initial to state_final.
@@ -314,9 +523,13 @@ def ComputeTrajectory(state_initial, state_final, min_time, max_time, test_traj 
         CompassGaitController(compass_gait, params))
     
     context = compass_gait.CreateDefaultContext()
-    print(context)
     
-    return controller.compute_trajectory(state_initial, state_final, min_time, max_time, test_traj)
+    if DMOC:
+        compute_traj_method = controller.compute_trajectory_DMOC
+    else:
+        compute_traj_method = controller.compute_trajectory
+    
+    return compute_traj_method(state_initial, state_final, min_time, max_time, test_traj)
     # return should be states, u, time_step if test_traj is None
 
 if __name__ == '__main__':
